@@ -11,7 +11,7 @@ therefore entries (de)serialization in front of the cache will be needed in most
 ```go
 import "github.com/allegro/bigcache"
 
-cache := bigcache.NewBigCache(bigcache.DefaultConfig(10 * time.Minute))
+cache, _ := bigcache.NewBigCache(bigcache.DefaultConfig(10 * time.Minute))
 
 cache.Set("my-unique-key", []byte("value"))
 
@@ -25,17 +25,37 @@ When cache load can be predicted in advance then it is better to use custom init
 allocation can be avoided in that way.
 
 ```go
-import "github.com/allegro/bigcache"
+import (
+	"log"
 
-config := bigcache.Config{
-		Shards: 1000,                       // number of shards
-		LifeWindow: 10 * time.Minute,       // time after which entry can be evicted
-		MaxEntriesInWindow: 1000 * 10 * 60, // rps * lifeWindow
-		MaxEntrySize: 500,                  // max entry size in bytes, used only in initial memory allocation
-		Verbose: true,                      // prints information about additional memory allocation
+	"github.com/allegro/bigcache"
+)
+
+config := bigcache.Config {
+		// number of shards (must be a power of 2)
+		Shards: 1024,
+		// time after which entry can be evicted
+		LifeWindow: 10 * time.Minute,
+		// rps * lifeWindow, used only in initial memory allocation
+		MaxEntriesInWindow: 1000 * 10 * 60,
+		// max entry size in bytes, used only in initial memory allocation
+		MaxEntrySize: 500,
+		// prints information about additional memory allocation
+		Verbose: true,
+		// cache will not allocate more memory than this limit, value in MB
+		// if value is reached then the oldest entries can be overridden for the new ones
+		// 0 value means no size limit
+		HardMaxCacheSize: 8192,
+		// callback fired when the oldest entry is removed because of its
+		// expiration time or no space left for the new entry. Default value is nil which
+		// means no callback and it prevents from unwrapping the oldest entry.
+		OnRemove: nil,
 	}
 
-cache := bigcache.NewBigCache(config)
+cache, initErr := bigcache.NewBigCache(config)
+if initErr != nil {
+	log.Fatal(initErr)
+}
 
 cache.Set("my-unique-key", []byte("value"))
 
@@ -52,43 +72,42 @@ Benchmark tests were made on MacBook Pro (3 GHz Processor Intel Core i7, 16GB Me
 ### Writes and reads
 
 ```
-go test -bench=. -benchtime=10s ./...
+cd caches_bench; go test -bench=. -benchtime=10s ./... -timeout 30m
 
-BenchmarkMapSet-4              	10000000	      1691 ns/op
-BenchmarkFreeCacheSet-4        	20000000	      1309 ns/op
-BenchmarkBigCacheSet-4         	20000000	      1110 ns/op
-BenchmarkMapGet-4              	30000000	       544 ns/op
-BenchmarkFreeCacheGet-4        	20000000	      1020 ns/op
-BenchmarkBigCacheGet-4         	20000000	       766 ns/op
-BenchmarkBigCacheSetParallel-4 	20000000	       563 ns/op
-BenchmarkFreeCacheSetParallel-4	30000000	       666 ns/op
-BenchmarkBigCacheGetParallel-4 	50000000	       625 ns/op
-BenchmarkFreeCacheGetParallel-4	20000000	       696 ns/op
-ok  	github.com/allegro/bigcache/caches_bench	470.259s
+BenchmarkMapSet-4              	20000000	      1681 ns/op	     296 B/op	       3 allocs/op
+BenchmarkFreeCacheSet-4        	20000000	      1132 ns/op	     349 B/op	       3 allocs/op
+BenchmarkBigCacheSet-4         	20000000	       831 ns/op	     305 B/op	       2 allocs/op
+BenchmarkMapGet-4              	30000000	       540 ns/op	      24 B/op	       2 allocs/op
+BenchmarkFreeCacheGet-4        	20000000	       986 ns/op	     152 B/op	       4 allocs/op
+BenchmarkBigCacheGet-4         	20000000	       726 ns/op	      40 B/op	       3 allocs/op
+BenchmarkBigCacheSetParallel-4 	20000000	       532 ns/op	     313 B/op	       3 allocs/op
+BenchmarkFreeCacheSetParallel-4	20000000	       564 ns/op	     357 B/op	       4 allocs/op
+BenchmarkBigCacheGetParallel-4 	50000000	       338 ns/op	      40 B/op	       3 allocs/op
+BenchmarkFreeCacheGetParallel-4	30000000	       581 ns/op	     152 B/op	       4 allocs/op
 ```
 
-Parallel writes and reads in bigcache and freecache are on very similar level.
-In serial tests reads are slightly faster in bigcache than in fastcache.
+Writes and reads in bigcache are faster than in freecache.
+Writes to map are the slowest.
 
 ### GC pause time
 
 ```
-go run caches_gc_overhead_comparsion.go
+cd caches_bench; go run caches_gc_overhead_comparsion.go
 
 Number of entries:  20000000
-GC pause for bigcache:  50.8121ms
-GC pause for freecache:  29.451837ms
-GC pause for map:  11.231013483s
+GC pause for bigcache:  27.81671ms
+GC pause for freecache:  30.218371ms
+GC pause for map:  11.590772251s
 ```
 
 Test shows how long are the GC pauses for caches filled with 20mln of entries.
-Freecache has the shortest GC pause time, bigcache is slightly slower.
+Bigcache and freecache have very similar GC pause time.
 It is clear that both reduce GC overhead in contrast to map
 which GC pause time took more than 10 seconds.
 
 ## How it works
 
-BigCache relays on optimization presented in 1.5 version of Go ([issue-9477](https://github.com/golang/go/issues/9477)).
+BigCache relies on optimization presented in 1.5 version of Go ([issue-9477](https://github.com/golang/go/issues/9477)).
 This optimization states that if map without pointers in keys and values is used then GC will omit it’s content.
 Therefore BigCache uses `map[uint64]uint32` where keys are hashed and values are offsets of entries.
 
@@ -98,14 +117,20 @@ because GC will only see single pointer to it.
 
 ## Bigcache vs Freecache
 Both caches provide the same core features but they reduce GC overhead in different ways.
-Bigcache relays on `map[uint64]uint32`, freecache implements its own mapping built on
+Bigcache relies on `map[uint64]uint32`, freecache implements its own mapping built on
 slices to reduce number of pointers.
 
 Results from benchmark tests are presented above.
 One of the advantage of bigcache over freecache is that you don’t need to know
-the size of cache in advance, because when bigcache is full,
-it allocates additional memory for new entries instead of
+the size of the cache in advance, because when bigcache is full,
+it can allocate additional memory for new entries instead of
 overwriting existing ones as freecache does currently.
+However hard max size in bigcache also can be set, check [HardMaxCacheSize](https://godoc.org/github.com/allegro/bigcache#Config).
+
+
+## More
+
+Bigcache genesis is described in allegro.tech blog post: [writing a very fast cache service in Go](http://allegro.tech/2016/03/writing-fast-cache-service-in-go.html)
 
 ## License
 
